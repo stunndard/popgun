@@ -6,6 +6,7 @@ package popgun
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,8 @@ const (
 
 type Config struct {
 	ListenInterface string `json:"listen_interface"`
+	UseTls          bool
+	TlsConfig       *tls.Config
 }
 
 type Authorizator interface {
@@ -38,8 +41,9 @@ type Backend interface {
 	Uidl(user string) (uids []string, err error)
 	UidlMessage(user string, msgId int) (exists bool, uid string, err error)
 	Update(user string) error
-	Lock(user string) error
+	Lock(user string) (inUse bool, err error)
 	Unlock(user string) error
+	TopMessage(user string, msgId, msgLines int) (exists bool, message string, err error)
 }
 
 var (
@@ -74,6 +78,7 @@ func newClient(authorizator Authorizator, backend Backend) *Client {
 	commands["RSET"] = RsetCommand{}
 	commands["UIDL"] = UidlCommand{}
 	commands["CAPA"] = CapaCommand{}
+	commands["TOP"] = TopCommand{}
 
 	return &Client{
 		commands:     commands,
@@ -85,7 +90,7 @@ func newClient(authorizator Authorizator, backend Backend) *Client {
 
 func (c Client) handle(conn net.Conn) {
 	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(1 * time.Minute))
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Minute))
 	c.printer = NewPrinter(conn)
 
 	c.isAlive = true
@@ -95,6 +100,9 @@ func (c Client) handle(conn net.Conn) {
 
 	for c.isAlive {
 		// according to RFC commands are terminated by CRLF, but we are removing \r in parseInput
+		if c.currentState == STATE_TRANSACTION {
+			_ = conn.SetReadDeadline(time.Now().Add(1 * time.Minute))
+		}
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -102,7 +110,7 @@ func (c Client) handle(conn net.Conn) {
 			} else {
 				log.Print("Error reading input: ", err)
 			}
-			if len(c.user) > 0 {
+			if c.currentState == STATE_TRANSACTION {
 				log.Printf("Unlocking user %s due to connection error ", c.user)
 				c.backend.Unlock(c.user)
 			}
@@ -118,8 +126,8 @@ func (c Client) handle(conn net.Conn) {
 		}
 		state, err := exec.Run(&c, args)
 		if err != nil {
-			c.printer.Err("Error executing command %s", cmd)
-			log.Print("Error executing command: ", err)
+			//c.printer.Err("Error executing command %s", cmd)
+			log.Printf("Error executing command %s: %s %v", cmd, args, err)
 			continue
 		}
 		c.lastCommand = cmd
@@ -142,23 +150,29 @@ type Server struct {
 	backend  Backend
 }
 
-func NewServer(cfg Config, auth Authorizator, backend Backend) *Server {
+func NewServer(cfg *Config, auth Authorizator, backend Backend) *Server {
 	return &Server{
-		config:  cfg,
+		config:  *cfg,
 		auth:    auth,
 		backend: backend,
 	}
 }
 
-func (s Server) Start() error {
-
+func (s *Server) Start() error {
 	var err error
-	s.listener, err = net.Listen("tcp", s.config.ListenInterface)
-	if err != nil {
-		log.Printf("Error: could not listen on %s", s.config.ListenInterface)
-		return err
+	if s.config.UseTls {
+		s.listener, err = tls.Listen("tcp", s.config.ListenInterface, s.config.TlsConfig)
+		if err != nil {
+			log.Printf("Error: could not listen on %s", s.config.ListenInterface)
+			return err
+		}
+	} else {
+		s.listener, err = net.Listen("tcp", s.config.ListenInterface)
+		if err != nil {
+			log.Printf("Error: could not listen on %s", s.config.ListenInterface)
+			return err
+		}
 	}
-
 	go func() {
 		log.Printf("Server listening on: %s\n", s.config.ListenInterface)
 		for {
