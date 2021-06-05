@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DevelHell/popgun/backends"
+	"github.com/stunndard/popgun/backends"
 )
 
 func TestClient_handle(t *testing.T) {

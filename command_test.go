@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/DevelHell/popgun/backends"
+	"github.com/stunndard/popgun/backends"
 )
 
 type cmdTestCase struct {
