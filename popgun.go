@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"time"
@@ -21,10 +20,17 @@ const (
 	STATE_UPDATE
 )
 
+const (
+	LOG_INFO = iota + 1
+	LOG_DEBUG
+	LOG_ERROR
+)
+
 type Config struct {
-	ListenInterface string `json:"listen_interface"`
+	ListenInterface string
 	UseTls          bool
 	TlsConfig       *tls.Config
+	ServerName      string
 }
 
 type Authorizator interface {
@@ -44,6 +50,7 @@ type Backend interface {
 	Lock(user string) (inUse bool, err error)
 	Unlock(user string) error
 	TopMessage(user string, msgId, msgLines int) (exists bool, message string, err error)
+	Log(s string, loglevel int)
 }
 
 var (
@@ -62,9 +69,10 @@ type Client struct {
 	user         string
 	pass         string
 	lastCommand  string
+	serverName   string
 }
 
-func newClient(authorizator Authorizator, backend Backend) *Client {
+func newClient(authorizator Authorizator, backend Backend, serverName string) *Client {
 	commands := make(map[string]Executable)
 
 	commands["QUIT"] = QuitCommand{}
@@ -85,6 +93,7 @@ func newClient(authorizator Authorizator, backend Backend) *Client {
 		currentState: STATE_AUTHORIZATION,
 		authorizator: authorizator,
 		backend:      backend,
+		serverName:   serverName,
 	}
 }
 
@@ -96,7 +105,7 @@ func (c Client) handle(conn net.Conn) {
 	c.isAlive = true
 	reader := bufio.NewReader(conn)
 
-	c.printer.Welcome()
+	c.printer.Welcome(fmt.Sprintf("+OK %s POP3 server ready\r\n", c.serverName))
 
 	for c.isAlive {
 		// according to RFC commands are terminated by CRLF, but we are removing \r in parseInput
@@ -106,12 +115,12 @@ func (c Client) handle(conn net.Conn) {
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				log.Print("Connection closed by client")
+				c.backend.Log("Connection closed by client", LOG_DEBUG)
 			} else {
-				log.Print("Error reading input: ", err)
+				c.backend.Log(fmt.Sprintf("Error reading input: %s", err), LOG_DEBUG)
 			}
 			if c.currentState == STATE_TRANSACTION {
-				log.Printf("Unlocking user %s due to connection error ", c.user)
+				c.backend.Log(fmt.Sprintf("Unlocking user %s due to connection error", c.user), LOG_DEBUG)
 				c.backend.Unlock(c.user)
 			}
 			break
@@ -121,13 +130,13 @@ func (c Client) handle(conn net.Conn) {
 		exec, ok := c.commands[cmd]
 		if !ok {
 			c.printer.Err("Invalid command %s", cmd)
-			log.Printf("Invalid command: %s", cmd)
+			c.backend.Log(fmt.Sprintf("Invalid command: %s", cmd), LOG_DEBUG)
 			continue
 		}
 		state, err := exec.Run(&c, args)
 		if err != nil {
 			//c.printer.Err("Error executing command %s", cmd)
-			log.Printf("Error executing command %s: %s %v", cmd, args, err)
+			c.backend.Log(fmt.Sprintf("Error executing command %s: %s %v", cmd, args, err), LOG_DEBUG)
 			continue
 		}
 		c.lastCommand = cmd
@@ -163,26 +172,26 @@ func (s *Server) Start() error {
 	if s.config.UseTls {
 		s.listener, err = tls.Listen("tcp", s.config.ListenInterface, s.config.TlsConfig)
 		if err != nil {
-			log.Printf("Error: could not listen on %s", s.config.ListenInterface)
+			s.backend.Log(fmt.Sprintf("Error: could not listen on %s", s.config.ListenInterface), LOG_DEBUG)
 			return err
 		}
 	} else {
 		s.listener, err = net.Listen("tcp", s.config.ListenInterface)
 		if err != nil {
-			log.Printf("Error: could not listen on %s", s.config.ListenInterface)
+			s.backend.Log(fmt.Sprintf("Error: could not listen on %s", s.config.ListenInterface), LOG_DEBUG)
 			return err
 		}
 	}
 	go func() {
-		log.Printf("Server listening on: %s\n", s.config.ListenInterface)
+		s.backend.Log(fmt.Sprintf("Server listening on: %s", s.config.ListenInterface), LOG_DEBUG)
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
-				log.Println("Error: could not accept connection: ", err)
+				s.backend.Log(fmt.Sprintf("Error: could not accept connection: %s", err), LOG_INFO)
 				continue
 			}
 
-			c := newClient(s.auth, s.backend)
+			c := newClient(s.auth, s.backend, s.config.ServerName)
 			go c.handle(conn)
 		}
 	}()
@@ -200,8 +209,8 @@ func NewPrinter(conn net.Conn) *Printer {
 	return &Printer{conn}
 }
 
-func (p Printer) Welcome() {
-	fmt.Fprintf(p.conn, "+OK POPgun POP3 server ready\r\n")
+func (p Printer) Welcome(s string) {
+	fmt.Fprintf(p.conn, s)
 }
 
 func (p Printer) Ok(msg string, a ...interface{}) {
